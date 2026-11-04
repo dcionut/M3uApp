@@ -29,6 +29,12 @@ class WorkflowTest(unittest.TestCase):
         with urlopen(Request(self.base + route, data=json.dumps(data).encode(), headers={'Content-Type': 'application/json'})) as response:
             return json.load(response)
 
+    def test_player_assets(self):
+        for path, expected in [('/', b'id="video"'), ('/player.js', b'function playEntry'), ('/vendor/hls.min.js', b'MANIFEST_PARSED')]:
+            with urlopen(self.base + path) as response:
+                self.assertEqual(response.status, 200)
+                self.assertIn(expected, response.read())
+
     def test_library_workflow(self):
         playlist = '\ufeff#EXTM3U\n#EXTINF:-1 tvg-id="42" group-title="Movies, HD",Example Movie\nhttps://example.com/movie.mp4\n'
         self.assertEqual(self.post('/api/import', {'text': playlist})['imported'], 1)

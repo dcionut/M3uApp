@@ -24,3 +24,11 @@ python -m unittest discover -s tests -v
 ```
 
 Provider links using `|User-Agent=...&Referer=...` and `#EXTVLCOPT:http-user-agent` / `http-referrer` directives are supported for downloads. HTTP errors appear with guidance in the Downloads panel. Expired links must be refreshed from your provider. TLS certificate verification remains enabled.
+
+## Play movies and TV
+
+Click **Play** on an entry to open the in-app player. Standard video controls provide pause, volume, seeking (when supported by the source), and fullscreen. **Stop / Close** releases the stream. Switching entries stops the previous stream.
+
+Direct movie playback uses your browser's supported codecs (MP4/H.264/AAC is widely supported). Live HLS `.m3u8` streams use native playback where available, or bundled HLS.js 1.6.15 (Apache-2.0; see `vendor/hls.LICENSE`). No CDN connection is needed to load the player. For extensionless HLS URLs, add `"stream-type": "hls"` to the entry metadata.
+
+Media is loaded directly from the provider in your browser. Providers must allow CORS for HLS.js. Custom User-Agent/Referer headers used for downloads cannot be applied by the browser player. MPEG-TS direct streams, DASH, DRM, and codecs unsupported by the browser are not converted; such entries may still require VLC. Playback does not fix unreachable hostnames or expired provider links.

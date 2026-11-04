@@ -167,6 +167,8 @@ class Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path == '/':
             self.send(Path(__file__).with_name('index.html').read_text(), content_type='text/html')
+        elif path in ('/player.js', '/vendor/hls.min.js'):
+            self.send((Path(__file__).parent / path.lstrip('/')).read_text(encoding='utf-8'), content_type='application/javascript')
         elif path == '/api/entries':
             self.send(entries())
         elif path == '/api/jobs':
