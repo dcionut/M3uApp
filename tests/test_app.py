@@ -68,6 +68,53 @@ class WorkflowTest(unittest.TestCase):
             media.shutdown()
             media.server_close()
 
+    def test_clear_preserves_downloaded_files(self):
+        folder = app.DATA / 'downloads'
+        folder.mkdir()
+        (folder / 'saved.mp4').write_bytes(b'keep')
+        self.post('/api/import', {'text': '#EXTINF:-1,Old movie\nhttps://example.com/old.mp4'})
+        self.post('/api/clear', {'confirm': True})
+        self.assertEqual(app.entries(), [])
+        self.assertEqual((folder / 'saved.mp4').read_bytes(), b'keep')
+        self.post('/api/import', {'text': '#EXTINF:-1,New movie\nhttps://example.com/new.mp4'})
+        self.assertEqual([e['title'] for e in app.entries()], ['New movie'])
+
+    def test_download_headers_and_failures(self):
+        class Provider(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == '/blocked.mp4':
+                    self.send_error(403)
+                    return
+                if self.path == '/short.mp4':
+                    self.send_response(200)
+                    self.send_header('Content-Length', '100')
+                    self.end_headers()
+                    self.wfile.write(b'short')
+                    return
+                if self.headers.get('Referer') != 'https://provider.example/' or self.headers.get('User-Agent') != 'Player':
+                    self.send_error(403)
+                    return
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'movie')
+        media = ThreadingHTTPServer(('127.0.0.1', 0), Provider)
+        threading.Thread(target=media.serve_forever, daemon=True).start()
+        try:
+            base = f'http://127.0.0.1:{media.server_port}'
+            entry = app.parse_m3u(f'#EXTINF:-1,Movie\n#EXTVLCOPT:http-referrer=https://provider.example/\n{base}/movie.mp4|User-Agent=Player')[0]
+            app.JOBS['headers'] = {'status': 'downloading', 'bytes': 0}
+            app.download('headers', entry)
+            self.assertEqual(app.JOBS['headers']['status'], 'complete')
+            for job, path in [('blocked', '/blocked.mp4'), ('short', '/short.mp4')]:
+                app.JOBS[job] = {'status': 'downloading', 'bytes': 0}
+                app.download(job, {'title': 'Movie', 'url': base + path})
+                self.assertEqual(app.JOBS[job]['status'], 'failed')
+            self.assertIn('403', app.JOBS['blocked']['error'])
+            self.assertEqual(list((app.DATA / 'downloads').glob('*.part')), [])
+        finally:
+            media.shutdown()
+            media.server_close()
+
     def test_reject_cross_origin(self):
         from urllib.error import HTTPError
         request = Request(self.base + '/api/import', data=b'{}', headers={'Origin': 'https://other.example'})

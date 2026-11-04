@@ -1,14 +1,14 @@
 """Local M3U library manager. Run with python app.py."""
 import argparse
 import json
-import os
 from pathlib import Path
 import re
 import sqlite3
 import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit, parse_qsl
 from urllib.request import Request, urlopen
 
 DATA = Path(__file__).parent / 'data'
@@ -37,6 +37,10 @@ def parse_m3u(text):
                 continue
             attrs = dict(re.findall(r'([\w-]+)="([^"]*)"', match[1]))
             pending = {'title': match[2].strip(), 'group': attrs.pop('group-title', ''), 'metadata': attrs}
+        elif line.startswith('#EXTVLCOPT:') and pending:
+            key, separator, value = line[11:].partition('=')
+            if separator and key in ('http-user-agent', 'http-referrer'):
+                pending['metadata'][key] = value
         elif line.startswith('#EXTGRP:') and pending:
             pending['group'] = line[8:]
         elif not line.startswith('#'):
@@ -72,35 +76,79 @@ def validate_entry(entry):
 
 
 def download(job_id, entry):
-    folder = DATA / 'downloads'
-    folder.mkdir(exist_ok=True)
-    name = re.sub(r'[^\w .-]', '_', entry['title']).strip('. ')[:100] or 'movie'
-    suffix = Path(urlsplit(entry['url']).path).suffix.lower()
-    suffix = suffix if re.fullmatch(r'\.[a-z0-9]{1,8}', suffix) else '.bin'
-    target = folder / f'{name}-{job_id[:8]}{suffix}'
-    partial = target.with_suffix(target.suffix + '.part')
+    partial = None
     try:
-        if urlsplit(entry['url']).scheme not in ('http', 'https'):
+        folder = DATA / 'downloads'
+        folder.mkdir(parents=True, exist_ok=True)
+        # Some IPTV providers append VLC-style HTTP headers to media URLs.
+        url, _, options = entry['url'].partition('|')
+        headers = {'User-Agent': 'Mozilla/5.0 (compatible; M3uApp/1.0)'}
+        metadata = entry.get('metadata', {})
+        for key, header in (('http-user-agent', 'User-Agent'), ('http-referrer', 'Referer')):
+            if metadata.get(key):
+                headers[header] = metadata[key]
+        for key, value in parse_qsl(options):
+            header = {'user-agent': 'User-Agent', 'referer': 'Referer', 'referrer': 'Referer'}.get(key.lower())
+            if header:
+                headers[header] = value
+        if urlsplit(url).scheme not in ('http', 'https'):
             raise ValueError('Downloads require an HTTP or HTTPS URL.')
+        suffix = Path(urlsplit(url).path).suffix.lower()
         if suffix in ('.m3u', '.m3u8', '.mpd'):
-            raise ValueError('Streaming manifests are not movie files. Use a direct movie URL.')
-        with urlopen(Request(entry['url'], headers={'User-Agent': 'M3uApp/1.0'}), timeout=30) as response:
+            raise ValueError('This is an HLS/DASH stream. Download requires a direct movie file URL (.mp4, .mkv, etc.).')
+        suffix = suffix if re.fullmatch(r'\.[a-z0-9]{1,8}', suffix) else '.bin'
+        name = re.sub(r'[^\w .-]', '_', entry['title']).strip('. ')[:80] or 'movie'
+        # A fixed prefix also avoids Windows reserved filenames such as CON.
+        target = folder / f'movie-{name}-{job_id[:8]}{suffix}'
+        partial = target.with_suffix(target.suffix + '.part')
+        with urlopen(Request(url, headers=headers), timeout=60) as response:
             if urlsplit(response.url).scheme not in ('http', 'https'):
                 raise ValueError('Unsupported redirect.')
-            if any(t in response.headers.get('Content-Type', '').lower() for t in ('mpegurl', 'dash+xml', 'text/html')):
-                raise ValueError('The URL returned a playlist or web page, not a movie file.')
+            content_type = response.headers.get('Content-Type', '').lower()
+            if any(t in content_type for t in ('mpegurl', 'dash+xml', 'text/html')):
+                raise ValueError('The provider returned a stream playlist or login page. Use a direct movie file URL.')
+            length = response.headers.get('Content-Length')
+            expected = int(length) if length and length.isdecimal() else None
+            received = 0
+            with LOCK:
+                JOBS[job_id]['total'] = expected
             with partial.open('xb') as output:
                 while chunk := response.read(256 * 1024):
+                    # Detect manifests even when providers send a generic content type.
+                    if received == 0 and chunk.lstrip().startswith((b'#EXTM3U', b'<MPD', b'<!DOCTYPE html', b'<html')):
+                        raise ValueError('The URL returned a stream playlist or web page instead of a movie file.')
                     output.write(chunk)
+                    received += len(chunk)
                     with LOCK:
-                        JOBS[job_id]['bytes'] += len(chunk)
+                        JOBS[job_id]['bytes'] = received
+            if not received or (expected is not None and received != expected):
+                raise ValueError('The connection ended before the complete movie arrived. Please retry the download.')
         partial.rename(target)
         with LOCK:
             JOBS[job_id].update(status='complete', file=target.name)
     except Exception as exc:
-        partial.unlink(missing_ok=True)
+        if partial is not None:
+            try:
+                partial.unlink(missing_ok=True)
+            except OSError:
+                pass
+        if isinstance(exc, HTTPError):
+            error = {
+                401: 'The provider requires authentication. Refresh your playlist or access link.',
+                403: 'The provider refused access (403). The link may have expired or require a Referer/User-Agent.',
+                404: 'Movie not found (404). Refresh your playlist or correct the media URL.',
+                429: 'The provider is limiting requests (429). Wait before retrying.',
+            }.get(exc.code, f'The provider returned HTTP {exc.code}. Please retry later.')
+        elif isinstance(exc, URLError):
+            error = 'Could not connect securely to the provider. Check your internet connection, the media URL, and your system certificates.'
+        elif isinstance(exc, PermissionError):
+            error = 'Cannot write to data/downloads. Move the app to a writable folder and restart it.'
+        elif isinstance(exc, OSError):
+            error = 'Network or disk error. Check your connection and available disk space, then retry.'
+        else:
+            error = str(exc)
         with LOCK:
-            JOBS[job_id].update(status='failed', error=str(exc))
+            JOBS[job_id].update(status='failed', error=error)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -149,6 +197,12 @@ class Handler(BaseHTTPRequestHandler):
                         validate_entry(entry)
                         con.execute('INSERT INTO entries(title,url,"group",metadata) VALUES(?,?,?,?)', (entry['title'], entry['url'], entry['group'], json.dumps(entry['metadata'])))
                 self.send({'imported': len(imported)})
+            elif self.path == '/api/clear':
+                if body.get('confirm') is not True:
+                    raise ValueError('Confirm clearing the library first.')
+                with db() as con:
+                    con.execute('DELETE FROM entries')
+                self.send({'cleared': True})
             elif self.path == '/api/save':
                 validate_entry(body)
                 with db() as con:
